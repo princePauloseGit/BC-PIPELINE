@@ -1,0 +1,403 @@
+# Azure DevOps Pipeline for Business Central CI/CD
+# Branch: Prince/Dev2
+# Target: Docker Container BC26gb
+# Optimized with dynamic app deployment
+
+trigger:
+  branches:
+    include:
+      - Prince/Dev2
+
+pool:
+  name: 'BC-PPM'
+  demands:
+    - agent.name -equals BC-Agent
+
+variables:
+  projectPath: 'C:\AL\AzurePipeLine\TOBC'
+  compilerPath: 'C:\AL\AzurePipeLine\TOBC\CICD\win32\alc.exe'
+  packageCachePath: 'C:\AL\AzurePipeLine\TOBC\.alpackages'
+  containerName: 'BC26gb'
+  tenantId: 'default'
+  username: 'vmadmin'
+  # bcPassword is defined as a secret variable in Azure DevOps UI
+
+stages:
+  - stage: Build
+    displayName: 'Build Business Central App'
+    jobs:
+      - job: Compile
+        displayName: 'Compile AL Project'
+        steps:
+          - task: PowerShell@2
+            displayName: 'Setup and Copy Source Code'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "🔧 Setting up build environment..."
+                Write-Host "Agent: $env:AGENT_NAME | Branch: $(Build.SourceBranch)"
+                
+                $sourcePath = "$(Build.SourcesDirectory)"
+                $projectPath = "$(projectPath)"
+                
+                try {
+                    # Create project directory if needed
+                    if (-not (Test-Path $projectPath)) {
+                        New-Item -ItemType Directory -Path $projectPath -Force | Out-Null
+                        Write-Host "📁 Created project directory: $projectPath"
+                    }
+                    
+                    # Copy source files (including .rdlc files, excluding build artifacts and version control)
+                    $excludePatterns = @("*.git*", "*.vs*", "*node_modules*", "*obj*", "*bin*", "*.txt")
+                    Get-ChildItem -Path $sourcePath | Where-Object { 
+                        $item = $_
+                        -not ($excludePatterns | Where-Object { $item.Name -like $_ })
+                    } | ForEach-Object {
+                        Copy-Item -Path $_.FullName -Destination $projectPath -Recurse -Force -ErrorAction Stop
+                    }
+                    
+                    # Verify app.json and extract app info
+                    $appJsonPath = Join-Path $projectPath "app.json"
+                    if (-not (Test-Path $appJsonPath)) {
+                        Write-Error "❌ app.json not found in $appJsonPath"
+                        exit 1
+                    }
+                    
+                    try {
+                        $appJsonContent = Get-Content $appJsonPath -Raw
+                        Write-Host "📋 app.json content: $appJsonContent"
+                        $appJson = $appJsonContent | ConvertFrom-Json
+                        if (-not $appJson.version) {
+                            Write-Error "❌ Version field missing or empty in app.json"
+                            exit 1
+                        }
+                        Write-Host "✅ Project: $($appJson.name) v$($appJson.version)"
+                        Write-Host "##vso[task.setvariable variable=appVersion;isOutput=true]$($appJson.version)"
+                    }
+                    catch {
+                        Write-Error "❌ Failed to parse app.json: $($_.Exception.Message)"
+                        exit 1
+                    }
+                                      
+                    
+                  
+                }
+                catch {
+                    Write-Error "❌ Setup failed: $($_.Exception.Message)"
+                    exit 1
+                }
+
+          - task: PowerShell@2
+            displayName: 'Verify Dependencies'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "🔍 Verifying build dependencies..."
+                
+                try {
+                    # Check AL Compiler
+                    $compilerPath = "$(compilerPath)"
+                    if (-not (Test-Path $compilerPath)) {
+                        Write-Error "❌ AL Compiler not found: $compilerPath"
+                        exit 1
+                    }
+                    Write-Host "✅ AL Compiler found"
+                    
+                    # Check Package Cache
+                    $packageCachePath = "$(packageCachePath)"
+                    if (-not (Test-Path $packageCachePath)) {
+                        Write-Error "❌ Package cache not found: $packageCachePath"
+                        exit 1
+                    }
+                    
+                    # List dependencies in package cache
+                    Write-Host "📋 Package cache contents: ${packageCachePath}"
+                    Get-ChildItem -Path $packageCachePath -Filter "*.app" | ForEach-Object {
+                        Write-Host "  - $($_.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
+                    }
+                    $packageCount = (Get-ChildItem -Path $packageCachePath -Filter "*.app").Count
+                    Write-Host "✅ Package cache ready: $packageCount packages"
+                }
+                catch {
+                    Write-Error "❌ Dependency verification failed: $($_.Exception.Message)"
+                    exit 1
+                }
+
+          - task: PowerShell@2
+            displayName: 'Compile Business Central App'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "🔨 Compiling Business Central App..."
+                
+                $projectPath = "$(projectPath)"
+                $compilerPath = "$(compilerPath)"
+                $packageCachePath = "$(packageCachePath)"
+                
+                try {
+                    # Clean old app and txt files from project root
+                    Get-ChildItem $projectPath -Filter "*.app" -File | Where-Object { 
+                        $_.DirectoryName -eq $projectPath 
+                    } | Remove-Item -Force -ErrorAction SilentlyContinue
+                    Get-ChildItem $projectPath -Filter "*.txt" -File | Where-Object { 
+                        $_.DirectoryName -eq $projectPath 
+                    } | Remove-Item -Force -ErrorAction SilentlyContinue
+                    
+                    $originalLocation = Get-Location
+                    Set-Location $projectPath
+                    
+                    $compilationStartTime = Get-Date
+                    Write-Host "⏰ Starting compilation at: $compilationStartTime"
+                    
+                    # Read app.json to get app name and version for output file
+                    $appJsonPath = Join-Path $projectPath "app.json"
+                    if (-not (Test-Path $appJsonPath)) {
+                        Write-Error "❌ app.json not found in $appJsonPath"
+                        exit 1
+                    }
+                    Write-Host "📋 Verifying app.json at: $appJsonPath"
+                    $appJson = Get-Content $appJsonPath -Raw | ConvertFrom-Json
+                    $appName = $appJson.name -replace '\s+', ''
+                    $appPublisher = $appJson.publisher -replace '\s+', ''
+                    $appVersion = $appJson.version
+                    if (-not $appVersion) {
+                        Write-Warning "⚠️ Version missing in app.json, using fallback: 1.31.260.23"
+                        $appVersion = "1.31.260.23"
+                    }
+                    $outputAppFile = Join-Path $projectPath "${appPublisher}_${appName}_${appVersion}.app"
+                    
+                    # Run AL Compiler with argument array to avoid parsing issues
+                    $compilerArgs = @(
+                        "/project:`"$projectPath`"",
+                        "/packagecachepath:`"$packageCachePath`"",
+                        "/out:`"$outputAppFile`"",
+                        "/generateReportLayout:no"
+                    )
+                    Write-Host "📋 Compiler command: & `"$compilerPath`" $compilerArgs"
+                    $output = & $compilerPath $compilerArgs 2>&1
+                    $exitCode = $LASTEXITCODE
+                    
+                    # Handle compiler output
+                    if ($output) {
+                        Write-Host "📋 Compiler output: $output"
+                        if ($output -match "error AL") {
+                            Write-Error "❌ Compilation errors detected in output: $output"
+                            exit 1
+                        }
+                    }
+                    
+                    # Verify compilation results
+                    $freshAppFiles = Get-ChildItem -Path $projectPath -Filter "*.app" -Depth 0 | 
+                        Where-Object { $_.LastWriteTime -gt $compilationStartTime }
+                    
+                    if ($freshAppFiles.Count -gt 0) {
+                        Write-Host "✅ Compilation successful!"
+                        foreach ($file in $freshAppFiles) {
+                            Write-Host "  📦 $($file.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
+                            # Set the app file path for deployment
+                            Write-Host "##vso[task.setvariable variable=appFilePath;isOutput=true]$($file.FullName)"
+                        }
+                        Write-Host "##vso[task.setvariable variable=compilationSuccess;isOutput=true]true"
+                    } else {
+                        Write-Error "❌ No app files generated"
+                        exit 1
+                    }
+                    
+                    if ($exitCode -ne 0) {
+                        Write-Error "❌ Compilation failed with exit code: $exitCode"
+                        exit 1
+                    }
+                }
+                catch {
+                    Write-Error "❌ Compilation error: $($_.Exception.Message)"
+                    exit 1
+                }
+                finally {
+                    Set-Location $originalLocation
+                }
+
+          - task: CopyFiles@2
+            displayName: 'Stage Build Artifacts'
+            inputs:
+              SourceFolder: '$(projectPath)'
+              Contents: '*.app'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)'
+            condition: succeeded()
+
+          - task: PublishBuildArtifacts@1
+            displayName: 'Publish Build Artifacts'
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)'
+              artifactName: 'BusinessCentralApp'
+              publishLocation: 'Container'
+            condition: succeeded()
+
+  - stage: Deploy
+    displayName: 'Deploy to Business Central'
+    dependsOn: Build
+    condition: succeeded()
+    variables:
+      appVersion: $[stageDependencies.Build.Compile.outputs['Compile.SetupandCopySourceCode.appVersion']]
+    jobs:
+      - deployment: DeployToBC
+        displayName: 'Deploy to BC Container'
+        environment: 'BC-Development'
+        pool:
+          name: 'BC-PPM'
+          demands:
+            - agent.name -equals BC-Agent
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadBuildArtifacts@1
+                  displayName: 'Download Build Artifacts'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'BusinessCentralApp'
+                    downloadPath: '$(Agent.BuildDirectory)\Artifacts'
+
+                - task: PowerShell@2
+                  displayName: 'Debug Artifact Download'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "📋 Contents of $(Agent.BuildDirectory)\Artifacts:"
+                      Get-ChildItem -Path "$(Agent.BuildDirectory)\Artifacts" -Recurse | ForEach-Object {
+                          Write-Host "  - $($_.FullName) ($([math]::Round($_.Length/1KB, 2)) KB)"
+                      }
+
+                - task: PowerShell@2
+                  displayName: 'Deploy Business Central App'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      Write-Host "🚀 Starting Business Central App Deployment..."
+                      
+                      try {
+                          # Static app configuration
+                          $AppId = "0ea865e1-18f8-45e0-ac0f-8ed306955813"
+                          $AppName = "TravelOperations Business"
+                          $AppVersion = "$(appVersion)"
+                          Write-Host "🔍 AppVersion: $AppVersion"
+                          
+                          # Define artifact path
+                          $artifactPath = "$(Agent.BuildDirectory)\Artifacts\BusinessCentralApp"
+                          Write-Host "🔍 Artifact directory: ${artifactPath}"
+                          
+                          # Ensure artifact directory exists
+                          if (-not (Test-Path $artifactPath)) {
+                              Write-Error "❌ Artifact directory not found: ${artifactPath}"
+                              exit 1
+                          }
+                          
+                          # Debug: List all app files in artifact directory
+                          Write-Host "📋 Available app files in ${artifactPath}:"
+                          $appFiles = Get-ChildItem -Path $artifactPath -Filter "*.app"
+                          foreach ($file in $appFiles) {
+                              Write-Host "  - $($file.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
+                          }
+                          
+                          # Get app file (try version-specific first, fallback to any .app if needed)
+                          Write-Host "🔎 Searching for app file with version: $AppVersion"
+                          $appFile = $null
+                          if ($AppVersion) {
+                              $appFile = Get-ChildItem -Path $artifactPath -Filter "*_$($AppVersion).app" | Select-Object -First 1
+                          }
+                          
+                          if (-not $appFile) {
+                              Write-Host "⚠️ No version-specific app file found, attempting fallback..."
+                              $appFile = Get-ChildItem -Path $artifactPath -Filter "*.app" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                              if ($appFile) {
+                                  # Extract version from file name if AppVersion is empty
+                                  if (-not $AppVersion) {
+                                      $fileName = $appFile.Name
+                                      $versionMatch = [regex]::Match($fileName, '_((\d+\.){3}\d+)\.app$')
+                                      if ($versionMatch.Success) {
+                                          $AppVersion = $versionMatch.Groups[1].Value
+                                          Write-Host "🔍 Extracted version from file name: $AppVersion"
+                                      }
+                                  }
+                              }
+                          }
+                          
+                          if (-not $appFile) {
+                              Write-Error "❌ No app file found in ${artifactPath}"
+                              exit 1
+                          }
+                          
+                          $AppFilePath = $appFile.FullName
+                          Write-Host "📦 Selected app file: $($appFile.Name)"
+                          
+                          # Deployment variables
+                          $ContainerName = "$(containerName)"
+                          $TenantId = "$(tenantId)"
+                          $Username = "$(username)"
+                          $Password = "$(bcPassword)"
+                          
+                          Write-Host "🎯 Target: $ContainerName | Tenant: $TenantId"
+                          Write-Host "📋 App: $AppName v$AppVersion"
+                          Write-Host "🆔 App ID: $AppId"
+                          
+                          # Import BCContainerHelper
+                          Import-Module BCContainerHelper -ErrorAction Stop
+                          
+                          # Setup credentials
+                          $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+                          $Credential = New-Object PSCredential ($Username, $SecurePassword)
+                          
+                          # Uninstall existing app from tenant
+                          Write-Host "🗑️ Removing existing app installations..."
+                          $InstalledApps = Get-BcContainerAppInfo -containerName $ContainerName -tenant $TenantId -installedOnly
+                          foreach ($App in $InstalledApps | Where-Object { $_.AppId -eq $AppId }) {
+                              Write-Host "  Uninstalling: $($App.Name) v$($App.Version)"
+                              UnInstall-BcContainerApp -containerName $ContainerName -name $App.Name -version $App.Version -tenant $TenantId -force
+                          }
+                          
+                          # Unpublish all versions
+                          Write-Host "🧹 Unpublishing previous versions..."
+                          $PublishedApps = Get-BcContainerAppInfo -containerName $ContainerName | Where-Object {
+                              $_.AppId -eq $AppId
+                          }
+                          foreach ($App in $PublishedApps) {
+                              Write-Host "  Unpublishing: $($App.Name) v$($App.Version)"
+                              UnPublish-BcContainerApp -containerName $ContainerName -name $App.Name -version $App.Version
+                          }
+                          
+                          # Deploy new version
+                          Write-Host "📦 Publishing new app..."
+                          Publish-BcContainerApp -containerName $ContainerName -appFile $AppFilePath -credential $Credential -SkipVerification
+                          
+                          Write-Host "🔄 Syncing app..."
+                          Sync-BcContainerApp -containerName $ContainerName -appName $AppName -appVersion $AppVersion -tenant $TenantId -force
+                          
+                          Write-Host "🔄 Upgrading data..."
+                          Start-BcContainerAppDataUpgrade -containerName $ContainerName -appName $AppName -appVersion $AppVersion -tenant $TenantId
+                          
+                          Write-Host "🔧 Installing app..."
+                          Install-BcContainerApp -containerName $ContainerName -appName $AppName -appVersion $AppVersion -tenant $TenantId -force
+                          
+                          # Verify deployment
+                          Write-Host "🔍 Verifying deployment..."
+                          $FinalApp = Get-BcContainerAppInfo -containerName $ContainerName -tenant $TenantId -installedOnly | Where-Object {
+                              $_.AppId -eq $AppId -and $_.Version -eq $AppVersion
+                          }
+                          
+                          if ($FinalApp) {
+                              Write-Host "✅ Deployment successful: $($FinalApp.Name) v$($FinalApp.Version)"
+                          } else {
+                              Write-Error "❌ Deployment verification failed"
+                              exit 1
+                          }
+                      }
+                      catch {
+                          Write-Error "❌ Deployment failed: $($_.Exception.Message)"
+                          exit 1
+                      }
+                      finally {
+                          # Clean up temporary files
+                          Write-Host "🧹 Cleaning artifact directory: ${artifactPath}"
+                          Remove-Item -Path "${artifactPath}\*.app" -Force -ErrorAction SilentlyContinue
+                      }
+                  env:
+                    bcPassword: $(bcPassword)
