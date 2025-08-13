@@ -1,2 +1,5 @@
 If using azure-pipelines.yml then you will have to keep the compiler files in the Project files
 - Setup Agent Pool and agents 
+refer documents 
+https://dynamics.folio3.com/blog/microsoft-dynamics-365-business-central-deployment-using-azure-devops-ci-cd/
+https://community.dynamics.com/blogs/post/?postid=ef9e336b-5684-4f12-9ef9-678648f1e607
