@@ -1,0 +1,2 @@
+If using azure-pipelines.yml then you will have to keep the compiler files in the Project files
+- Setup Agent Pool and agents 
